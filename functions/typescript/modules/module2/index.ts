@@ -1,45 +1,77 @@
-import { injectLambdaContext } from '@aws-lambda-powertools/logger/middleware';
-import { captureLambdaHandler } from '@aws-lambda-powertools/tracer/middleware';
-import type { AttributeValue } from '@aws-sdk/client-dynamodb';
+import { injectLambdaContext } from "@aws-lambda-powertools/logger/middleware";
+import { captureLambdaHandler } from "@aws-lambda-powertools/tracer/middleware";
+import type { AttributeValue } from "@aws-sdk/client-dynamodb";
 import {
   GetSecretValueCommand,
   SecretsManagerClient,
-} from '@aws-sdk/client-secrets-manager';
-import { unmarshall } from '@aws-sdk/util-dynamodb';
-import { logger, tracer } from '@commons/powertools';
-import middy from '@middy/core';
-import type { Context, DynamoDBRecord, DynamoDBStreamEvent } from 'aws-lambda';
-import { NoLabelsFoundError, NoPersonFoundError } from './errors.js';
-import { getLabels, reportImageIssue } from './utils.js';
+} from "@aws-sdk/client-secrets-manager";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
+import { logger, tracer } from "@commons/powertools";
+import middy from "@middy/core";
+import {
+  BatchProcessor,
+  EventType,
+  processPartialResponse,
+} from "@aws-lambda-powertools/batch";
+import type {
+  Context,
+  DynamoDBBatchResponse,
+  DynamoDBRecord,
+  DynamoDBStreamEvent,
+} from "aws-lambda";
+import { NoLabelsFoundError, NoPersonFoundError } from "./errors.js";
+import { getLabels, reportImageIssue } from "./utils.js";
 
-const s3BucketFiles = process.env.BUCKET_NAME_FILES || '';
-const apiUrlHost = process.env.API_URL_HOST || '';
-const apiKeySecretName = process.env.API_KEY_SECRET_NAME || '';
+import { getParameter } from "@aws-lambda-powertools/parameters/ssm";
+import { getSecret } from "@aws-lambda-powertools/parameters/secrets";
 
-const secretsClient = new SecretsManagerClient({});
+const s3BucketFiles = process.env.BUCKET_NAME_FILES || "";
+const apiUrlParameterName = process.env.API_URL_PARAMETER_NAME || "";
+const apiKeySecretName = process.env.API_KEY_SECRET_NAME || "";
 
-const getSecret = async (secretName: string): Promise<string | undefined> => {
-  const command = new GetSecretValueCommand({
-    SecretId: secretName,
-  });
-  const response = await secretsClient.send(command);
-  const secret = response.SecretString;
-  if (!secret) {
-    throw new Error(`Unable to get secret ${secretName}`);
+const processor = new BatchProcessor(EventType.DynamoDBStreams);
+
+const recordHandler = async (
+  record: DynamoDBRecord,
+  lambdaContext: Context
+): Promise<void> => {
+  if (lambdaContext.getRemainingTimeInMillis() < 1000) {
+    logger.warn(
+      "Invocation is about to time out, marking all remaining records as failed",
+      {
+        fileId: record.dynamodb?.NewImage?.id.S,
+        userId: record.dynamodb?.NewImage?.userId.S,
+      }
+    );
+    throw new Error(
+      "Time remaining <1s, marking record as failed to retry later"
+    );
   }
-
-  return secret;
-};
-
-const recordHandler = async (record: DynamoDBRecord): Promise<void> => {
+  // Create a segment to trace the execution of the function and add the file id and user id as annotations
+  const recordSegment = tracer
+    .getSegment()
+    ?.addNewSubsegment("### recordHandler");
+  recordSegment && tracer.setSegment(recordSegment);
   // Since we are applying the filter at the DynamoDB Stream level,
   // we know that the record has a NewImage otherwise the record would not be here
   const data = unmarshall(
     record.dynamodb?.NewImage as Record<string, AttributeValue>
   );
   const { id: fileId, userId, transformedFileKey } = data;
+  // Add the file id and user id to the logger so that all the logs after this
+  // will have these attributes and we can correlate them
+  logger.appendKeys({
+    fileId,
+    userId,
+  });
+
+  // Add the file id and user id as annotations to the segment so that we can correlate the logs with the traces
+  tracer.putAnnotation("fileId", fileId);
+  tracer.putAnnotation("userId", userId);
 
   try {
+    // Get the labels from Rekognition
+    logger.info("Attempting to getLabels");
     // Get the labels from Rekognition
     await getLabels(s3BucketFiles, fileId, userId, transformedFileKey);
   } catch (error) {
@@ -49,24 +81,37 @@ const recordHandler = async (record: DynamoDBRecord): Promise<void> => {
       error instanceof NoLabelsFoundError
     ) {
       await reportImageIssue(fileId, userId, {
-        apiUrl: JSON.parse(apiUrlHost).url,
-        apiKey: await getSecret(apiKeySecretName),
+        apiUrl: (
+          await getParameter<{ url: string }>(apiUrlParameterName, {
+            transform: "json",
+            maxAge: 900,
+          })
+        )?.url,
+        apiKey: await getSecret<string>(apiKeySecretName, { maxAge: 900 }),
       });
 
       return;
     }
 
     throw error;
+  } finally {
+    // Remove the file id and user id from the logger
+    logger.removeKeys(["fileId", "userId"]);
+    // Close & restore the segment
+    recordSegment?.close();
+    recordSegment && tracer.setSegment(recordSegment.parent);
   }
 };
 
 export const handler = middy(
-  async (event: DynamoDBStreamEvent, _context: Context): Promise<void> => {
-    const records = event.Records;
-
-    for (const record of records) {
-      await recordHandler(record);
-    }
+  async (
+    event: DynamoDBStreamEvent,
+    context: Context
+  ): Promise<DynamoDBBatchResponse> => {
+    return processPartialResponse(event, recordHandler, processor, {
+      context,
+      processInParallel: false,
+    });
   }
 )
   .use(captureLambdaHandler(tracer))
